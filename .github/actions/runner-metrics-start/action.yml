@@ -47,7 +47,7 @@ runs:
         esac
         resolve() {
           curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$1/releases/latest" \
-            | grep -m1 '"tag_name"' | cut -d'"' -f4 | sed 's/^v//'
+            | awk -F'"' '/"tag_name"/ && !seen++ { sub(/^v/, "", $4); print $4 }'
         }
         if [ "$NODE_EXPORTER_VERSION" = latest ]; then NODE_EXPORTER_VERSION="$(resolve prometheus/node_exporter)"; fi
         if [ "$PROMETHEUS_VERSION" = latest ]; then PROMETHEUS_VERSION="$(resolve prometheus/prometheus)"; fi
@@ -82,7 +82,7 @@ runs:
           if curl -fsS http://127.0.0.1:9100/metrics > /dev/null 2>&1; then break; fi
           sleep 1
         done
-        curl -fsS http://127.0.0.1:9100/metrics | head -n 1
+        curl -fsS http://127.0.0.1:9100/metrics | awk 'NR == 1'
 
     - name: Start remote write agent
       shell: bash

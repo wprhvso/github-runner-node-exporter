@@ -2,8 +2,6 @@ name: Remote
 
 on:
   workflow_dispatch:
-  push:
-    branches: ["feature/**"]
 
 jobs:
   remote:
@@ -55,7 +53,7 @@ jobs:
           sleep 20
           stats="$(curl -fsS http://127.0.0.1:9099/metrics)"
           echo "$stats" | grep -E '^prometheus_remote_storage_' || true
-          sum() { echo "$stats" | grep -E "^$1" | awk '{s+=$NF} END {printf "%.0f", s+0}'; }
+          sum() { echo "$stats" | awk -v pattern="^$1" '$0 ~ pattern { s += $NF } END { printf "%.0f", s + 0 }'; }
           sent="$(sum 'prometheus_remote_storage_samples_total')"
           succeeded="$(sum 'prometheus_remote_storage_succeeded_samples_total')"
           failed="$(sum 'prometheus_remote_storage_samples_failed_total')"

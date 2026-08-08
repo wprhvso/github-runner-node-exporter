@@ -37,13 +37,13 @@ runs:
           echo "### Sample"
           echo
           echo '```'
-          grep -E '^(node_cpu_seconds_total|node_memory_MemAvailable_bytes|node_memory_MemTotal_bytes|node_load1|node_disk_read_bytes_total|node_disk_written_bytes_total|node_network_receive_bytes_total|gha_step_active)' "$root/sample.prom" 2>/dev/null | head -n 25 || echo "no metrics collected"
+          grep -E '^(node_cpu_seconds_total|node_memory_MemAvailable_bytes|node_memory_MemTotal_bytes|node_load1|node_disk_read_bytes_total|node_disk_written_bytes_total|node_network_receive_bytes_total|gha_step_active)' "$root/sample.prom" 2>/dev/null | awk 'NR <= 25' || echo "no metrics collected"
           echo '```'
           echo
           echo "### Series count"
           echo
           echo '```'
-          echo "total exposed: $(grep -cv '^#' "$root/sample.prom" 2>/dev/null || echo 0)"
+          echo "total exposed: $(awk '!/^#/ { n++ } END { print n + 0 }' "$root/sample.prom" 2>/dev/null || echo 0)"
           echo '```'
         } >> "$GITHUB_STEP_SUMMARY"
         if [ "${RUNNER_METRICS_REMOTE_WRITE:-}" = "enabled" ]; then
@@ -52,7 +52,7 @@ runs:
             echo "### Remote storage"
             echo
             echo '```'
-            grep -E '^prometheus_remote_storage_(samples|succeeded_samples|failed_samples)' "$root/agent.prom" 2>/dev/null | head -n 20 || echo "no remote storage metrics"
+            grep -E '^prometheus_remote_storage_(samples|succeeded_samples|failed_samples)' "$root/agent.prom" 2>/dev/null | awk 'NR <= 20' || echo "no remote storage metrics"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
         fi
@@ -67,7 +67,7 @@ runs:
         set -uo pipefail
         if [ -z "${RUNNER_METRICS_ROOT:-}" ]; then exit 0; fi
         root="$RUNNER_METRICS_ROOT"
-        rm -f "$RUNNER_METRICS_TEXTFILE_DIR/step.prom"
+        rm -f "$root/textfile/step.prom"
         sleep "$DRAIN_SECONDS"
         if [ -n "${RUNNER_METRICS_AGENT_PID:-}" ]; then
           kill -TERM "$RUNNER_METRICS_AGENT_PID" 2>/dev/null || true
