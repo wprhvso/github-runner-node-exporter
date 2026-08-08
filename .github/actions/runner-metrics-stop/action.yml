@@ -1,0 +1,98 @@
+name: Runner metrics stop
+description: Flushes pending runner metrics, stops collectors and writes a report
+
+inputs:
+  drain-seconds:
+    description: Seconds to keep collecting before shutdown
+    required: false
+    default: "10"
+  flush-timeout:
+    description: Seconds to wait for the agent to flush pending samples
+    required: false
+    default: "30"
+  report:
+    description: Write a metrics report into the job summary
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Collect report
+      shell: bash
+      env:
+        WRITE_REPORT: ${{ inputs.report }}
+      run: |
+        set -uo pipefail
+        if [ -z "${RUNNER_METRICS_ROOT:-}" ]; then exit 0; fi
+        if [ "$WRITE_REPORT" != "true" ]; then exit 0; fi
+        root="$RUNNER_METRICS_ROOT"
+        curl -fsS http://127.0.0.1:9100/metrics > "$root/sample.prom" 2>/dev/null || true
+        curl -fsS http://127.0.0.1:9099/metrics > "$root/agent.prom" 2>/dev/null || true
+        {
+          echo "## Runner metrics report"
+          echo
+          echo "remote write: ${RUNNER_METRICS_REMOTE_WRITE:-unknown}"
+          echo
+          echo "### Sample"
+          echo
+          echo '```'
+          grep -E '^(node_cpu_seconds_total|node_memory_MemAvailable_bytes|node_memory_MemTotal_bytes|node_load1|node_disk_read_bytes_total|node_disk_written_bytes_total|node_network_receive_bytes_total|gha_step_active)' "$root/sample.prom" 2>/dev/null | head -n 25 || echo "no metrics collected"
+          echo '```'
+          echo
+          echo "### Series count"
+          echo
+          echo '```'
+          echo "total exposed: $(grep -cv '^#' "$root/sample.prom" 2>/dev/null || echo 0)"
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+        if [ "${RUNNER_METRICS_REMOTE_WRITE:-}" = "enabled" ]; then
+          {
+            echo
+            echo "### Remote storage"
+            echo
+            echo '```'
+            grep -E '^prometheus_remote_storage_(samples|succeeded_samples|failed_samples)' "$root/agent.prom" 2>/dev/null | head -n 20 || echo "no remote storage metrics"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Stop collectors
+      shell: bash
+      env:
+        DRAIN_SECONDS: ${{ inputs.drain-seconds }}
+        FLUSH_TIMEOUT: ${{ inputs.flush-timeout }}
+        WRITE_REPORT: ${{ inputs.report }}
+      run: |
+        set -uo pipefail
+        if [ -z "${RUNNER_METRICS_ROOT:-}" ]; then exit 0; fi
+        root="$RUNNER_METRICS_ROOT"
+        rm -f "$RUNNER_METRICS_TEXTFILE_DIR/step.prom"
+        sleep "$DRAIN_SECONDS"
+        if [ -n "${RUNNER_METRICS_AGENT_PID:-}" ]; then
+          kill -TERM "$RUNNER_METRICS_AGENT_PID" 2>/dev/null || true
+          for i in $(seq 1 "$FLUSH_TIMEOUT"); do
+            kill -0 "$RUNNER_METRICS_AGENT_PID" 2>/dev/null || break
+            sleep 1
+          done
+          kill -KILL "$RUNNER_METRICS_AGENT_PID" 2>/dev/null || true
+        fi
+        if [ -n "${RUNNER_METRICS_NODE_EXPORTER_PID:-}" ]; then
+          kill -TERM "$RUNNER_METRICS_NODE_EXPORTER_PID" 2>/dev/null || true
+        fi
+        if [ "$WRITE_REPORT" = "true" ]; then
+          {
+            echo
+            echo "### node_exporter log"
+            echo
+            echo '```'
+            tail -n 15 "$root/node_exporter.log" 2>/dev/null || echo "no log"
+            echo '```'
+            echo
+            echo "### prometheus log"
+            echo
+            echo '```'
+            tail -n 25 "$root/prometheus.log" 2>/dev/null || echo "no log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi

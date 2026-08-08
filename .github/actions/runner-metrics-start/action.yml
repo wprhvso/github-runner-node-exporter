@@ -1,0 +1,154 @@
+name: Runner metrics start
+description: Starts node_exporter and a Prometheus agent on the runner and streams runner metrics to remote write
+
+inputs:
+  remote-write-url:
+    description: Prometheus remote write endpoint. When empty the action collects locally only.
+    required: false
+    default: ""
+  username:
+    description: Basic auth username
+    required: false
+    default: ""
+  password:
+    description: Basic auth password
+    required: false
+    default: ""
+  scrape-interval:
+    description: Scrape interval for runner metrics
+    required: false
+    default: 5s
+  node-exporter-version:
+    description: node_exporter version without leading v, or latest
+    required: false
+    default: latest
+  prometheus-version:
+    description: Prometheus version without leading v, or latest
+    required: false
+    default: latest
+
+runs:
+  using: composite
+  steps:
+    - name: Install collectors
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        NODE_EXPORTER_VERSION: ${{ inputs.node-exporter-version }}
+        PROMETHEUS_VERSION: ${{ inputs.prometheus-version }}
+      run: |
+        set -euo pipefail
+        root="$RUNNER_TEMP/runner-metrics"
+        mkdir -p "$root/bin" "$root/textfile" "$root/wal"
+        case "$(uname -m)" in
+          x86_64) arch=amd64 ;;
+          aarch64) arch=arm64 ;;
+          *) echo "unsupported architecture $(uname -m)" >&2; exit 1 ;;
+        esac
+        resolve() {
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$1/releases/latest" \
+            | grep -m1 '"tag_name"' | cut -d'"' -f4 | sed 's/^v//'
+        }
+        if [ "$NODE_EXPORTER_VERSION" = latest ]; then NODE_EXPORTER_VERSION="$(resolve prometheus/node_exporter)"; fi
+        if [ "$PROMETHEUS_VERSION" = latest ]; then PROMETHEUS_VERSION="$(resolve prometheus/prometheus)"; fi
+        echo "node_exporter $NODE_EXPORTER_VERSION, prometheus $PROMETHEUS_VERSION, arch $arch"
+        curl -fsSL "https://github.com/prometheus/node_exporter/releases/download/v${NODE_EXPORTER_VERSION}/node_exporter-${NODE_EXPORTER_VERSION}.linux-${arch}.tar.gz" \
+          | tar -xz -C "$root/bin" --strip-components=1 "node_exporter-${NODE_EXPORTER_VERSION}.linux-${arch}/node_exporter"
+        curl -fsSL "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-${arch}.tar.gz" \
+          | tar -xz -C "$root/bin" --strip-components=1 "prometheus-${PROMETHEUS_VERSION}.linux-${arch}/prometheus"
+        echo "RUNNER_METRICS_ROOT=$root" >> "$GITHUB_ENV"
+        echo "RUNNER_METRICS_TEXTFILE_DIR=$root/textfile" >> "$GITHUB_ENV"
+
+    - name: Start node exporter
+      shell: bash
+      run: |
+        set -euo pipefail
+        root="$RUNNER_METRICS_ROOT"
+        nohup "$root/bin/node_exporter" \
+          --web.listen-address=127.0.0.1:9100 \
+          --collector.disable-defaults \
+          --collector.cpu \
+          --collector.meminfo \
+          --collector.loadavg \
+          --collector.diskstats \
+          --collector.netdev \
+          --collector.filesystem \
+          --collector.pressure \
+          --collector.textfile \
+          --collector.textfile.directory="$root/textfile" \
+          > "$root/node_exporter.log" 2>&1 &
+        echo "RUNNER_METRICS_NODE_EXPORTER_PID=$!" >> "$GITHUB_ENV"
+        for i in $(seq 1 30); do
+          if curl -fsS http://127.0.0.1:9100/metrics > /dev/null 2>&1; then break; fi
+          sleep 1
+        done
+        curl -fsS http://127.0.0.1:9100/metrics | head -n 1
+
+    - name: Start remote write agent
+      shell: bash
+      env:
+        REMOTE_WRITE_URL: ${{ inputs.remote-write-url }}
+        REMOTE_WRITE_USERNAME: ${{ inputs.username }}
+        REMOTE_WRITE_PASSWORD: ${{ inputs.password }}
+        SCRAPE_INTERVAL: ${{ inputs.scrape-interval }}
+      run: |
+        set -euo pipefail
+        root="$RUNNER_METRICS_ROOT"
+        if [ -z "${REMOTE_WRITE_URL:-}" ]; then
+          echo "remote write url is empty, metrics are collected locally only"
+          echo "RUNNER_METRICS_REMOTE_WRITE=disabled" >> "$GITHUB_ENV"
+          exit 0
+        fi
+        umask 077
+        printf '%s' "$REMOTE_WRITE_PASSWORD" > "$root/password"
+        cat > "$root/agent.yml" <<EOF
+        global:
+          scrape_interval: ${SCRAPE_INTERVAL}
+          external_labels:
+            gha_repository: "${GITHUB_REPOSITORY}"
+            gha_workflow: "${GITHUB_WORKFLOW}"
+            gha_job: "${GITHUB_JOB}"
+            gha_run_id: "${GITHUB_RUN_ID}"
+            gha_run_attempt: "${GITHUB_RUN_ATTEMPT}"
+            gha_ref_name: "${GITHUB_REF_NAME}"
+            gha_runner_os: "${RUNNER_OS}"
+            gha_runner_arch: "${RUNNER_ARCH}"
+        scrape_configs:
+          - job_name: github_runner
+            static_configs:
+              - targets: ["127.0.0.1:9100"]
+                labels:
+                  instance: "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+            metric_relabel_configs:
+              - source_labels: [__name__]
+                regex: "node_cpu_seconds_total|node_memory_MemTotal_bytes|node_memory_MemAvailable_bytes|node_memory_Cached_bytes|node_load1|node_disk_read_bytes_total|node_disk_written_bytes_total|node_disk_io_time_seconds_total|node_network_receive_bytes_total|node_network_transmit_bytes_total|node_filesystem_avail_bytes|node_filesystem_size_bytes|node_pressure_.*_waiting_seconds_total|gha_.*"
+                action: keep
+        remote_write:
+          - url: "${REMOTE_WRITE_URL}"
+            basic_auth:
+              username: "${REMOTE_WRITE_USERNAME}"
+              password_file: "${root}/password"
+            queue_config:
+              max_shards: 1
+              batch_send_deadline: 5s
+              min_backoff: 250ms
+              max_backoff: 5s
+        EOF
+        if "$root/bin/prometheus" --agent --help > /dev/null 2>&1; then
+          agent_flag="--agent"
+        else
+          agent_flag="--enable-feature=agent"
+        fi
+        echo "agent flag: $agent_flag"
+        nohup "$root/bin/prometheus" "$agent_flag" \
+          --config.file="$root/agent.yml" \
+          --storage.agent.path="$root/wal" \
+          --web.listen-address=127.0.0.1:9099 \
+          > "$root/prometheus.log" 2>&1 &
+        echo "RUNNER_METRICS_AGENT_PID=$!" >> "$GITHUB_ENV"
+        echo "RUNNER_METRICS_REMOTE_WRITE=enabled" >> "$GITHUB_ENV"
+        for i in $(seq 1 30); do
+          if curl -fsS http://127.0.0.1:9099/metrics > /dev/null 2>&1; then break; fi
+          sleep 1
+        done
+        curl -fsS http://127.0.0.1:9099/-/ready || true

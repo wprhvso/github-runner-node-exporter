@@ -1,0 +1,61 @@
+name: Smoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, "feature/**"]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/runner-metrics-start
+
+      - uses: ./.github/actions/runner-metrics-mark
+        with:
+          step: burn-cpu
+
+      - name: Burn cpu
+        run: |
+          for i in $(seq 1 "$(nproc)"); do (timeout 45 bash -c 'while :; do :; done') & done
+          wait
+
+      - uses: ./.github/actions/runner-metrics-mark
+        with:
+          step: burn-disk
+
+      - name: Burn disk
+        run: |
+          dd if=/dev/zero of="$RUNNER_TEMP/blob" bs=1M count=2048 conv=fdatasync status=none
+          rm -f "$RUNNER_TEMP/blob"
+
+      - uses: ./.github/actions/runner-metrics-mark
+        with:
+          step: idle
+
+      - name: Idle
+        run: sleep 20
+
+      - uses: ./.github/actions/runner-metrics-stop
+        if: always()
+
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/runner-metrics-start
+        with:
+          remote-write-url: ""
+
+      - uses: ./.github/actions/runner-metrics-mark
+        with:
+          step: whatever
+
+      - name: Do nothing
+        run: sleep 5
+
+      - uses: ./.github/actions/runner-metrics-stop
+        if: always()
