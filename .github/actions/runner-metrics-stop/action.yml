@@ -52,7 +52,7 @@ runs:
             echo "### Remote storage"
             echo
             echo '```'
-            grep -E '^prometheus_remote_storage_(samples|succeeded_samples|failed_samples)' "$root/agent.prom" 2>/dev/null | awk 'NR <= 20' || echo "no remote storage metrics"
+            grep -E '^prometheus_remote_storage_samples' "$root/agent.prom" 2>/dev/null | awk 'NR <= 20' || echo "no remote storage metrics"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
         fi

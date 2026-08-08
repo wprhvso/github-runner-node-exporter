@@ -12,6 +12,8 @@ jobs:
       - name: Check secrets
         env:
           REMOTE_WRITE_URL: ${{ secrets.PROMETHEUS_REMOTE_WRITE_URL }}
+          REMOTE_WRITE_USERNAME: ${{ secrets.PROMETHEUS_REMOTE_WRITE_USERNAME }}
+          REMOTE_WRITE_PASSWORD: ${{ secrets.PROMETHEUS_REMOTE_WRITE_PASSWORD }}
         run: |
           set -euo pipefail
           if [ -z "${REMOTE_WRITE_URL:-}" ]; then
@@ -22,6 +24,10 @@ jobs:
             https://*) ;;
             *) echo "endpoint must use https" >&2; exit 1 ;;
           esac
+          if [ -z "${REMOTE_WRITE_USERNAME:-}" ] || [ -z "${REMOTE_WRITE_PASSWORD:-}" ]; then
+            echo "PROMETHEUS_REMOTE_WRITE_USERNAME or PROMETHEUS_REMOTE_WRITE_PASSWORD is not set" >&2
+            exit 1
+          fi
 
       - uses: ./.github/actions/runner-metrics-start
         with:
@@ -52,30 +58,29 @@ jobs:
           set -euo pipefail
           sleep 20
           stats="$(curl -fsS http://127.0.0.1:9099/metrics)"
-          echo "$stats" | grep -E '^prometheus_remote_storage_' || true
+          echo "$stats" | grep -E '^prometheus_remote_storage_samples' || true
           sum() { echo "$stats" | awk -v pattern="^$1" '$0 ~ pattern { s += $NF } END { printf "%.0f", s + 0 }'; }
           sent="$(sum 'prometheus_remote_storage_samples_total')"
-          succeeded="$(sum 'prometheus_remote_storage_succeeded_samples_total')"
           failed="$(sum 'prometheus_remote_storage_samples_failed_total')"
-          failed_legacy="$(sum 'prometheus_remote_storage_failed_samples_total')"
-          delivered=$(( ${sent:-0} + ${succeeded:-0} ))
-          broken=$(( ${failed:-0} + ${failed_legacy:-0} ))
-          echo "delivered=$delivered broken=$broken"
+          pending="$(sum 'prometheus_remote_storage_samples_pending')"
+          delivered=$(( sent - failed ))
+          echo "delivered=$delivered failed=$failed pending=$pending"
           {
             echo "## Remote write verification"
             echo
             echo '```'
             echo "delivered: $delivered"
-            echo "failed:    $broken"
+            echo "failed:    $failed"
+            echo "pending:   $pending"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          if [ "$delivered" -eq 0 ]; then
-            echo "no samples reached the endpoint" >&2
+          if [ "$failed" -ne 0 ]; then
+            echo "endpoint rejected $failed samples" >&2
             tail -n 40 "$RUNNER_METRICS_ROOT/prometheus.log" >&2 || true
             exit 1
           fi
-          if [ "$broken" -ne 0 ]; then
-            echo "some samples failed to deliver" >&2
+          if [ "$delivered" -le 0 ]; then
+            echo "no samples reached the endpoint" >&2
             tail -n 40 "$RUNNER_METRICS_ROOT/prometheus.log" >&2 || true
             exit 1
           fi

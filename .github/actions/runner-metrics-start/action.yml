@@ -99,35 +99,54 @@ runs:
           echo "RUNNER_METRICS_REMOTE_WRITE=disabled" >> "$GITHUB_ENV"
           exit 0
         fi
+        url="$(printf '%s' "$REMOTE_WRITE_URL" | tr -d '[:space:]')"
+        username="$(printf '%s' "$REMOTE_WRITE_USERNAME" | tr -d '[:space:]')"
+        password="$(printf '%s' "$REMOTE_WRITE_PASSWORD" | tr -d '\r\n')"
+        if [ "${#url}" -ne "${#REMOTE_WRITE_URL}" ]; then echo "::warning::remote write url contained whitespace"; fi
+        if [ "${#username}" -ne "${#REMOTE_WRITE_USERNAME}" ]; then echo "::warning::username contained whitespace"; fi
+        if [ "${#password}" -ne "${#REMOTE_WRITE_PASSWORD}" ]; then echo "::warning::password contained line breaks"; fi
         umask 077
-        printf '%s' "$REMOTE_WRITE_PASSWORD" > "$root/password"
+        printf '%s' "$password" > "$root/password"
+        printf 'user = "%s"\n' "$(printf '%s:%s' "$username" "$password" | sed 's/\\/\\\\/g; s/"/\\"/g')" > "$root/curlrc"
+        status="$(curl -sS -o /dev/null -w '%{http_code}' -K "$root/curlrc" \
+          -H 'Content-Type: application/x-protobuf' \
+          -H 'Content-Encoding: snappy' \
+          -H 'X-Prometheus-Remote-Write-Version: 0.1.0' \
+          --data-binary '' "$url" || true)"
+        rm -f "$root/curlrc"
+        echo "preflight http status: $status"
+        case "$status" in
+          401|403) echo "endpoint rejected the basic auth credentials with http $status" >&2; exit 1 ;;
+          000) echo "::warning::endpoint did not answer the preflight request" ;;
+        esac
+        esc() { printf '%s' "$1" | sed "s/'/''/g"; }
         cat > "$root/agent.yml" <<EOF
         global:
-          scrape_interval: ${SCRAPE_INTERVAL}
+          scrape_interval: '$(esc "$SCRAPE_INTERVAL")'
           external_labels:
-            gha_repository: "${GITHUB_REPOSITORY}"
-            gha_workflow: "${GITHUB_WORKFLOW}"
-            gha_job: "${GITHUB_JOB}"
-            gha_run_id: "${GITHUB_RUN_ID}"
-            gha_run_attempt: "${GITHUB_RUN_ATTEMPT}"
-            gha_ref_name: "${GITHUB_REF_NAME}"
-            gha_runner_os: "${RUNNER_OS}"
-            gha_runner_arch: "${RUNNER_ARCH}"
+            gha_repository: '$(esc "$GITHUB_REPOSITORY")'
+            gha_workflow: '$(esc "$GITHUB_WORKFLOW")'
+            gha_job: '$(esc "$GITHUB_JOB")'
+            gha_run_id: '$(esc "$GITHUB_RUN_ID")'
+            gha_run_attempt: '$(esc "$GITHUB_RUN_ATTEMPT")'
+            gha_ref_name: '$(esc "$GITHUB_REF_NAME")'
+            gha_runner_os: '$(esc "$RUNNER_OS")'
+            gha_runner_arch: '$(esc "$RUNNER_ARCH")'
         scrape_configs:
           - job_name: github_runner
             static_configs:
               - targets: ["127.0.0.1:9100"]
                 labels:
-                  instance: "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+                  instance: '$(esc "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}")'
             metric_relabel_configs:
               - source_labels: [__name__]
                 regex: "node_cpu_seconds_total|node_memory_MemTotal_bytes|node_memory_MemAvailable_bytes|node_memory_Cached_bytes|node_load1|node_disk_read_bytes_total|node_disk_written_bytes_total|node_disk_io_time_seconds_total|node_network_receive_bytes_total|node_network_transmit_bytes_total|node_filesystem_avail_bytes|node_filesystem_size_bytes|node_pressure_.*_waiting_seconds_total|gha_.*"
                 action: keep
         remote_write:
-          - url: "${REMOTE_WRITE_URL}"
+          - url: '$(esc "$url")'
             basic_auth:
-              username: "${REMOTE_WRITE_USERNAME}"
-              password_file: "${root}/password"
+              username: '$(esc "$username")'
+              password_file: '$(esc "$root/password")'
             queue_config:
               max_shards: 1
               batch_send_deadline: 5s
