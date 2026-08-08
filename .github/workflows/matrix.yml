@@ -3,6 +3,10 @@ name: Matrix
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   matrix:
     runs-on: ${{ matrix.runner }}

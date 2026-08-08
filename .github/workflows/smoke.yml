@@ -5,6 +5,10 @@ on:
   pull_request:
   push:
 
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   smoke:
     runs-on: ubuntu-latest
