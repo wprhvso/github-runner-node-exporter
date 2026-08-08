@@ -1,4 +1,4 @@
-# github-runner-metrics
+# github-runner-node-exporter
 
 Composite-экшены, которые собирают метрики CPU / памяти / диска / сети с
 GitHub-hosted раннера и стримят их в любой Prometheus remote write endpoint.
