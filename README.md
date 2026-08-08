@@ -14,71 +14,31 @@ GitHub-hosted раннера и стримят их в любой Prometheus rem
 | `.github/workflows/matrix.yml` | То же самое на разных образах раннеров |
 | `.github/workflows/remote.yml` | Полный путь с реальной отправкой в remote write |
 
-## Что нажать
-
-### Шаг 1. Проверить сбор
-
-Залей репозиторий на GitHub как публичный. Открой вкладку **Actions**, если
-GitHub попросит включить workflow'ы — нажми
-**I understand my workflows, go ahead and enable them**.
-
-Push в `main` или в ветку `feature/*` сам запустит **Smoke**. Либо запусти
-вручную: **Smoke** → **Run workflow** → **Run workflow**. Около трёх минут.
-
-Открой завершившийся прогон, прокрути страницу с итогами вниз. Там блок
-**Runner metrics report** с образцом метрик и строкой `remote write: disabled`.
-
-### Шаг 2. Проверить отправку
-
-Добавь три секрета: **Settings** → **Secrets and variables** → **Actions** →
-**New repository secret**.
-
-| Имя | Пример значения |
-| --- | --- |
-| `PROMETHEUS_REMOTE_WRITE_URL` | `https://metrics.example.com/api/v1/write` |
-| `PROMETHEUS_REMOTE_WRITE_USERNAME` | `gha` |
-| `PROMETHEUS_REMOTE_WRITE_PASSWORD` | пароль |
-
-Запусти **Remote** → **Run workflow**. Job падает, если ни один сэмпл не ушёл
-или если часть отправок вернула ошибку.
-
-### Шаг 3. Проверить остальные образы
-
-**Matrix** → **Run workflow**. Пять джобов параллельно.
-
-## Как читать отчёт
-
-Здоровый отчёт содержит:
-
-- `node_cpu_seconds_total` с ненулевым значением
-- `node_memory_MemAvailable_bytes`
-- `gha_step_active{step="burn-cpu"}` — доказывает, что разметка шагов работает
-- в режиме отправки — блок `remote storage` с ненулевым `samples_total`
-  и нулевым `samples_failed_total`
-
-Если какой-то секции нет — соответствующий сборщик не отработал. В отчёт также
-попадают хвосты логов обоих сборщиков.
-
 ## Как использовать в своём workflow
 
 ```yaml
-- uses: actions/checkout@v7
+permissions:
+  contents: read
+  actions: read
 
-- uses: ./.github/actions/runner-metrics-start
-  with:
-    remote-write-url: ${{ secrets.PROMETHEUS_REMOTE_WRITE_URL }}
-    username: ${{ secrets.PROMETHEUS_REMOTE_WRITE_USERNAME }}
-    password: ${{ secrets.PROMETHEUS_REMOTE_WRITE_PASSWORD }}
+steps:
+  - uses: actions/checkout@v7
 
-- uses: ./.github/actions/runner-metrics-mark
-  with:
-    step: build
+  - uses: ./.github/actions/runner-metrics-start
+    with:
+      remote-write-url: ${{ secrets.PROMETHEUS_REMOTE_WRITE_URL }}
+      username: ${{ secrets.PROMETHEUS_REMOTE_WRITE_USERNAME }}
+      password: ${{ secrets.PROMETHEUS_REMOTE_WRITE_PASSWORD }}
 
-- name: Build
-  run: make build
+  - uses: ./.github/actions/runner-metrics-mark
+    with:
+      step: build
 
-- uses: ./.github/actions/runner-metrics-stop
-  if: always()
+  - name: Build
+    run: make build
+
+  - uses: ./.github/actions/runner-metrics-stop
+    if: always()
 ```
 
 `start` идёт сразу после checkout, `mark` — перед каждым шагом, который хочешь
@@ -86,6 +46,11 @@ Push в `main` или в ветку `feature/*` сам запустит **Smoke*
 
 С пустым `remote-write-url` все экшены превращаются в no-op, так что их безопасно
 держать в workflow до того, как появится endpoint.
+
+`actions: read` нужен, чтобы `start` спросил у API человекочитаемое имя джоба —
+то самое, что видно в интерфейсе, с раскрытой матрицей. Без этого права экшен
+напишет warning и подставит ключ джоба из YAML. Можно обойтись без API и задать
+имя руками: `job-name: ${{ matrix.runner }}`.
 
 ## Требования к endpoint'у
 
@@ -95,15 +60,22 @@ Push в `main` или в ветку `feature/*` сам запустит **Smoke*
 
 Фильтровать по IP бесполезно: диапазоны GitHub-hosted раннеров динамические.
 
-## Цена
-
-Примерно 20 лишних секунд на job: около 10 секунд на скачивание бинарей и
-10 секунд слива в конце.
+Перед стартом агента `start` делает preflight-запрос к endpoint'у. Если тот
+отвечает 401 или 403, job падает сразу с внятной ошибкой, а не спустя минуту
+среди логов Prometheus.
 
 ## Лейблы
 
-Каждый сэмпл несёт `gha_repository`, `gha_workflow`, `gha_job`, `gha_run_id`,
-`gha_run_attempt`, `gha_ref_name`, `gha_runner_os`, `gha_runner_arch`. Имена шагов
-приходят как лейбл `step` у `gha_step_active`.
+Каждый сэмпл несёт `gha_repository`, `gha_workflow`, `gha_job`, `gha_job_name`,
+`gha_run_id`, `gha_run_number`, `gha_run_attempt`, `gha_ref_name`,
+`gha_runner_os`, `gha_runner_arch`. Имена шагов приходят как лейбл `step` у
+`gha_step_active`.
+
+`gha_job` — ключ джоба из YAML, одинаковый для всех джобов матрицы.
+`gha_job_name` — имя из интерфейса, с раскрытой матрицей: `matrix (ubuntu-24.04-arm)`.
+Первый стабилен при переименованиях, второй читается человеком; поэтому есть оба.
+
+`instance` собирается как `workflow/имя джоба#номер.попытка` — уникален и при
+этом годится для выпадашки в Grafana как есть.
 
 `gha_run_id` высококардинален по своей природе. Держи retention этих серий коротким.
