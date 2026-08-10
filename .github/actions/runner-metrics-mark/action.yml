@@ -17,5 +17,7 @@ runs:
         set -euo pipefail
         if [ -z "${RUNNER_METRICS_TEXTFILE_DIR:-}" ]; then exit 0; fi
         dir="$RUNNER_METRICS_TEXTFILE_DIR"
-        printf '# HELP gha_step_active Currently running workflow step.\n# TYPE gha_step_active gauge\ngha_step_active{step="%s"} 1\n' "$RUNNER_METRICS_STEP" > "$dir/step.prom.tmp"
+        mkdir -p "$dir"
+        step="$(printf '%s' "$RUNNER_METRICS_STEP" | tr '\r\n' '  ' | sed 's/\\/\\\\/g; s/"/\\"/g')"
+        printf '# HELP gha_step_active Currently running workflow step.\n# TYPE gha_step_active gauge\ngha_step_active{step="%s"} 1\n' "$step" > "$dir/step.prom.tmp"
         mv "$dir/step.prom.tmp" "$dir/step.prom"

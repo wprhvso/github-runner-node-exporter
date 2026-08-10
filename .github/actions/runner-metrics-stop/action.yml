@@ -5,7 +5,7 @@ inputs:
   drain-seconds:
     description: Seconds to keep collecting before shutdown
     required: false
-    default: "10"
+    default: "5"
   flush-timeout:
     description: Seconds to wait for the agent to flush pending samples
     required: false
@@ -14,37 +14,75 @@ inputs:
     description: Write a metrics report into the job summary
     required: false
     default: "true"
+  cleanup:
+    description: Remove downloaded binaries and the agent write ahead log from the runner
+    required: false
+    default: "true"
 
 runs:
   using: composite
   steps:
-    - name: Collect report
+    - name: Drain and collect report
       shell: bash
       env:
+        DRAIN_SECONDS: ${{ inputs.drain-seconds }}
         WRITE_REPORT: ${{ inputs.report }}
       run: |
         set -uo pipefail
+        set +e
         if [ -z "${RUNNER_METRICS_ROOT:-}" ]; then exit 0; fi
-        if [ "$WRITE_REPORT" != "true" ]; then exit 0; fi
         root="$RUNNER_METRICS_ROOT"
-        curl -fsS http://127.0.0.1:9100/metrics > "$root/sample.prom" 2>/dev/null || true
-        curl -fsS http://127.0.0.1:9099/metrics > "$root/agent.prom" 2>/dev/null || true
+        rm -f "$root/textfile/step.prom"
+        sleep "$DRAIN_SECONDS"
+        curl -fsS http://127.0.0.1:9100/metrics > "$root/sample.prom" 2>/dev/null
+        curl -fsS http://127.0.0.1:9099/metrics > "$root/agent.prom" 2>/dev/null
+        metric() {
+          awk -v name="$1" '
+            $0 !~ /^#/ && ($1 == name || index($1, name "{") == 1) { v += $2; n++ }
+            END { if (n) printf "%.6f", v }
+          ' "$root/sample.prom" 2>/dev/null
+        }
+        human() {
+          awk -v v="$1" -v unit="$2" 'BEGIN {
+            if (v == "") { print "n/a"; exit }
+            if (unit == "gib") { printf "%.2f GiB", v / 1073741824; exit }
+            printf "%.1f s", v
+          }'
+        }
+        oom="$(awk '$1 == "node_vmstat_oom_kill" { printf "%d", $2 + 0 }' "$root/sample.prom" 2>/dev/null)"
+        oom="${oom:-0}"
+        cores="$(awk '
+          $0 !~ /^#/ && index($1, "node_cpu_seconds_total{") == 1 {
+            match($1, /cpu="[^"]*"/)
+            k = substr($1, RSTART + 5, RLENGTH - 6)
+            if (!(k in seen)) { seen[k] = 1; n++ }
+          }
+          END { printf "%d", n + 0 }
+        ' "$root/sample.prom" 2>/dev/null)"
+        root_avail="$(awk '
+          $0 !~ /^#/ && index($1, "node_filesystem_avail_bytes{") == 1 && index($1, "mountpoint=\"/\"") > 0 { printf "%.0f", $2; exit }
+        ' "$root/sample.prom" 2>/dev/null)"
+        if [ "${oom:-0}" -gt 0 ]; then
+          echo "::warning::the kernel oom killer fired $oom time(s) on this runner"
+        fi
+        if [ "$WRITE_REPORT" != "true" ]; then exit 0; fi
         {
           echo "## Runner metrics report"
           echo
           echo "remote write: ${RUNNER_METRICS_REMOTE_WRITE:-unknown}"
           echo
-          echo "### Sample"
-          echo
-          echo '```'
-          grep -E '^(node_cpu_seconds_total|node_memory_MemAvailable_bytes|node_memory_MemTotal_bytes|node_load1|node_disk_read_bytes_total|node_disk_written_bytes_total|node_network_receive_bytes_total|gha_step_active)' "$root/sample.prom" 2>/dev/null | awk 'NR <= 25' || echo "no metrics collected"
-          echo '```'
-          echo
-          echo "### Series count"
-          echo
-          echo '```'
-          echo "total exposed: $(awk '!/^#/ { n++ } END { print n + 0 }' "$root/sample.prom" 2>/dev/null || echo 0)"
-          echo '```'
+          echo "| Metric | Value |"
+          echo "| --- | --- |"
+          echo "| CPU cores | ${cores:-n/a} |"
+          echo "| Memory total | $(human "$(metric node_memory_MemTotal_bytes)" gib) |"
+          echo "| Memory available at the end | $(human "$(metric node_memory_MemAvailable_bytes)" gib) |"
+          echo "| Swap free at the end | $(human "$(metric node_memory_SwapFree_bytes)" gib) |"
+          echo "| Free space on / | $(human "${root_avail:-}" gib) |"
+          echo "| OOM kills | ${oom:-0} |"
+          echo "| CPU pressure since boot | $(human "$(metric node_pressure_cpu_waiting_seconds_total)" s) |"
+          echo "| Memory pressure since boot | $(human "$(metric node_pressure_memory_waiting_seconds_total)" s) |"
+          echo "| IO pressure since boot | $(human "$(metric node_pressure_io_waiting_seconds_total)" s) |"
+          echo "| Exposed series | $(awk '!/^#/ { n++ } END { print n + 0 }' "$root/sample.prom" 2>/dev/null) |"
         } >> "$GITHUB_STEP_SUMMARY"
         if [ "${RUNNER_METRICS_REMOTE_WRITE:-}" = "enabled" ]; then
           {
@@ -60,16 +98,23 @@ runs:
     - name: Stop collectors
       shell: bash
       env:
-        DRAIN_SECONDS: ${{ inputs.drain-seconds }}
         FLUSH_TIMEOUT: ${{ inputs.flush-timeout }}
         WRITE_REPORT: ${{ inputs.report }}
+        CLEANUP: ${{ inputs.cleanup }}
       run: |
         set -uo pipefail
+        set +e
         if [ -z "${RUNNER_METRICS_ROOT:-}" ]; then exit 0; fi
         root="$RUNNER_METRICS_ROOT"
-        rm -f "$root/textfile/step.prom"
-        sleep "$DRAIN_SECONDS"
         if [ -n "${RUNNER_METRICS_AGENT_PID:-}" ]; then
+          pending_timeout=$(( FLUSH_TIMEOUT / 2 ))
+          if [ "$pending_timeout" -lt 1 ]; then pending_timeout=1; fi
+          for i in $(seq 1 "$pending_timeout"); do
+            pending="$(curl -fsS http://127.0.0.1:9099/metrics 2>/dev/null \
+              | awk '$0 !~ /^#/ && index($1, "prometheus_remote_storage_samples_pending") == 1 { v += $2 } END { printf "%d", v + 0 }')"
+            if [ "${pending:-0}" -eq 0 ]; then break; fi
+            sleep 1
+          done
           kill -TERM "$RUNNER_METRICS_AGENT_PID" 2>/dev/null || true
           for i in $(seq 1 "$FLUSH_TIMEOUT"); do
             kill -0 "$RUNNER_METRICS_AGENT_PID" 2>/dev/null || break
@@ -96,3 +141,5 @@ runs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
         fi
+        rm -f "$root/password" "$root/curlrc" "$root/agent.yml"
+        if [ "$CLEANUP" = "true" ]; then rm -rf "$root"; fi
