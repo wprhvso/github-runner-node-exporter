@@ -27,7 +27,7 @@ inputs:
     required: false
     default: latest
   prometheus-version:
-    description: Prometheus version without leading v, or latest
+    description: Prometheus version without leading v, or latest. Downloaded only when remote write is enabled.
     required: false
     default: latest
 
@@ -40,42 +40,117 @@ runs:
         GH_TOKEN: ${{ github.token }}
         NODE_EXPORTER_VERSION: ${{ inputs.node-exporter-version }}
         PROMETHEUS_VERSION: ${{ inputs.prometheus-version }}
+        REMOTE_WRITE_URL: ${{ inputs.remote-write-url }}
       run: |
         set -euo pipefail
         root="$RUNNER_TEMP/runner-metrics"
         mkdir -p "$root/bin" "$root/textfile" "$root/wal"
         case "$(uname -m)" in
           x86_64) arch=amd64 ;;
-          aarch64) arch=arm64 ;;
+          aarch64 | arm64) arch=arm64 ;;
           *) echo "unsupported architecture $(uname -m)" >&2; exit 1 ;;
         esac
+        url="$(printf '%s' "$REMOTE_WRITE_URL" | tr -d '[:space:]')"
+        fetch() { curl -fsSL --retry 3 --retry-delay 2 "$@"; }
         resolve() {
-          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$1/releases/latest" \
-            | awk -F'"' '/"tag_name"/ && !seen++ { sub(/^v/, "", $4); print $4 }'
+          if [ "${GITHUB_API_URL:-https://api.github.com}" = "https://api.github.com" ]; then
+            fetch -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$1/releases/latest"
+          else
+            fetch "https://api.github.com/repos/$1/releases/latest"
+          fi | awk -F'"' '/"tag_name"/ && !seen++ { sub(/^v/, "", $4); print $4 }'
+        }
+        install_node_exporter() {
+          fetch "https://github.com/prometheus/node_exporter/releases/download/v${1}/node_exporter-${1}.linux-${arch}.tar.gz" \
+            | tar -xz -C "$root/bin" --strip-components=1 "node_exporter-${1}.linux-${arch}/node_exporter"
+        }
+        install_prometheus() {
+          fetch "https://github.com/prometheus/prometheus/releases/download/v${1}/prometheus-${1}.linux-${arch}.tar.gz" \
+            | tar -xz -C "$root/bin" --strip-components=1 "prometheus-${1}.linux-${arch}/prometheus"
         }
         if [ "$NODE_EXPORTER_VERSION" = latest ]; then NODE_EXPORTER_VERSION="$(resolve prometheus/node_exporter)"; fi
-        if [ "$PROMETHEUS_VERSION" = latest ]; then PROMETHEUS_VERSION="$(resolve prometheus/prometheus)"; fi
-        echo "node_exporter $NODE_EXPORTER_VERSION, prometheus $PROMETHEUS_VERSION, arch $arch"
-        curl -fsSL "https://github.com/prometheus/node_exporter/releases/download/v${NODE_EXPORTER_VERSION}/node_exporter-${NODE_EXPORTER_VERSION}.linux-${arch}.tar.gz" \
-          | tar -xz -C "$root/bin" --strip-components=1 "node_exporter-${NODE_EXPORTER_VERSION}.linux-${arch}/node_exporter"
-        curl -fsSL "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-${arch}.tar.gz" \
-          | tar -xz -C "$root/bin" --strip-components=1 "prometheus-${PROMETHEUS_VERSION}.linux-${arch}/prometheus"
-        echo "RUNNER_METRICS_ROOT=$root" >> "$GITHUB_ENV"
-        echo "RUNNER_METRICS_TEXTFILE_DIR=$root/textfile" >> "$GITHUB_ENV"
+        install_node_exporter "$NODE_EXPORTER_VERSION" &
+        node_exporter_pid=$!
+        prometheus_pid=""
+        if [ -n "$url" ]; then
+          if [ "$PROMETHEUS_VERSION" = latest ]; then PROMETHEUS_VERSION="$(resolve prometheus/prometheus)"; fi
+          install_prometheus "$PROMETHEUS_VERSION" &
+          prometheus_pid=$!
+          echo "node_exporter $NODE_EXPORTER_VERSION, prometheus $PROMETHEUS_VERSION, arch $arch"
+        else
+          echo "node_exporter $NODE_EXPORTER_VERSION, arch $arch, prometheus skipped"
+        fi
+        wait "$node_exporter_pid"
+        if [ -n "$prometheus_pid" ]; then wait "$prometheus_pid"; fi
+        {
+          echo "RUNNER_METRICS_ROOT=$root"
+          echo "RUNNER_METRICS_TEXTFILE_DIR=$root/textfile"
+        } >> "$GITHUB_ENV"
 
-    - name: Resolve job name
+    - name: Start node exporter
+      shell: bash
+      env:
+        GOMAXPROCS: "1"
+        GOGC: "50"
+      run: |
+        set -euo pipefail
+        root="$RUNNER_METRICS_ROOT"
+        nohup "$root/bin/node_exporter" \
+          --web.listen-address=127.0.0.1:9100 \
+          --web.disable-exporter-metrics \
+          --collector.disable-defaults \
+          --collector.cpu \
+          --collector.meminfo \
+          --collector.vmstat \
+          --collector.loadavg \
+          --collector.diskstats \
+          --collector.netdev \
+          --collector.netdev.device-exclude='^(lo|veth.*|tap.*)$' \
+          --collector.filesystem \
+          --collector.filesystem.mount-points-exclude='^/(dev|proc|run|sys|var/lib/docker/.+|var/lib/containers/.+)($|/)' \
+          --collector.pressure \
+          --collector.textfile \
+          --collector.textfile.directory="$root/textfile" \
+          > "$root/node_exporter.log" 2>&1 &
+        echo "RUNNER_METRICS_NODE_EXPORTER_PID=$!" >> "$GITHUB_ENV"
+        for i in $(seq 1 30); do
+          if curl -fsS -o /dev/null http://127.0.0.1:9100/metrics; then exit 0; fi
+          sleep 1
+        done
+        echo "node_exporter did not answer on 127.0.0.1:9100" >&2
+        tail -n 20 "$root/node_exporter.log" >&2 || true
+        exit 1
+
+    - name: Start remote write agent
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
         JOB_NAME_OVERRIDE: ${{ inputs.job-name }}
+        REMOTE_WRITE_URL: ${{ inputs.remote-write-url }}
+        REMOTE_WRITE_USERNAME: ${{ inputs.username }}
+        REMOTE_WRITE_PASSWORD: ${{ inputs.password }}
+        SCRAPE_INTERVAL: ${{ inputs.scrape-interval }}
+        GOMAXPROCS: "1"
+        GOGC: "50"
       run: |
         set -euo pipefail
+        root="$RUNNER_METRICS_ROOT"
+        url="$(printf '%s' "$REMOTE_WRITE_URL" | tr -d '[:space:]')"
+        if [ -z "$url" ]; then
+          echo "remote write url is empty, metrics are collected locally only"
+          echo "RUNNER_METRICS_REMOTE_WRITE=disabled" >> "$GITHUB_ENV"
+          exit 0
+        fi
+        username="$(printf '%s' "$REMOTE_WRITE_USERNAME" | tr -d '[:space:]')"
+        password="$(printf '%s' "$REMOTE_WRITE_PASSWORD" | tr -d '\r\n')"
+        if [ "${#url}" -ne "${#REMOTE_WRITE_URL}" ]; then echo "::warning::remote write url contained whitespace"; fi
+        if [ "${#username}" -ne "${#REMOTE_WRITE_USERNAME}" ]; then echo "::warning::username contained whitespace"; fi
+        if [ "${#password}" -ne "${#REMOTE_WRITE_PASSWORD}" ]; then echo "::warning::password contained line breaks"; fi
         name="$(printf '%s' "$JOB_NAME_OVERRIDE" | tr -d '\r\n')"
         if [ -z "$name" ] && ! command -v jq > /dev/null 2>&1; then
           echo "::warning::jq is missing on this image, falling back to the job key"
         elif [ -z "$name" ]; then
           jobs_url="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100"
-          status="$(curl -sS -o "$RUNNER_TEMP/jobs.json" -w '%{http_code}' \
+          status="$(curl -sS -o "$root/jobs.json" -w '%{http_code}' \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
@@ -83,65 +158,21 @@ runs:
           if [ "$status" != "200" ]; then
             echo "::warning::workflow run jobs api answered http $status, add 'permissions: actions: read' to the workflow"
           else
-            name="$(jq -r --arg runner "${RUNNER_NAME:-}" 'first(.jobs[]? | select(.status == "in_progress" and .runner_name == $runner)) | .name' "$RUNNER_TEMP/jobs.json" 2>/dev/null | tr -d '\r\n' || true)"
-            if [ -z "$name" ]; then echo "::warning::could not match this job by runner name ${RUNNER_NAME:-unset}"; fi
+            name="$(jq -r --arg runner "${RUNNER_NAME:-}" 'first(.jobs[]? | select(.status == "in_progress" and .runner_name == $runner)) | .name' "$root/jobs.json" 2>/dev/null | tr -d '\r\n' || true)"
+            if [ -z "$name" ] || [ "$name" = null ]; then
+              name=""
+              echo "::warning::could not match this job by runner name ${RUNNER_NAME:-unset}"
+            fi
           fi
-          rm -f "$RUNNER_TEMP/jobs.json"
+          rm -f "$root/jobs.json"
         fi
         if [ -z "$name" ]; then name="$GITHUB_JOB"; fi
         echo "job name: $name"
-        echo "RUNNER_METRICS_JOB_NAME=$name" >> "$GITHUB_ENV"
-
-    - name: Start node exporter
-      shell: bash
-      run: |
-        set -euo pipefail
-        root="$RUNNER_METRICS_ROOT"
-        nohup "$root/bin/node_exporter" \
-          --web.listen-address=127.0.0.1:9100 \
-          --collector.disable-defaults \
-          --collector.cpu \
-          --collector.meminfo \
-          --collector.loadavg \
-          --collector.diskstats \
-          --collector.netdev \
-          --collector.filesystem \
-          --collector.pressure \
-          --collector.textfile \
-          --collector.textfile.directory="$root/textfile" \
-          > "$root/node_exporter.log" 2>&1 &
-        echo "RUNNER_METRICS_NODE_EXPORTER_PID=$!" >> "$GITHUB_ENV"
-        for i in $(seq 1 30); do
-          if curl -fsS http://127.0.0.1:9100/metrics > /dev/null 2>&1; then break; fi
-          sleep 1
-        done
-        curl -fsS http://127.0.0.1:9100/metrics | awk 'NR == 1'
-
-    - name: Start remote write agent
-      shell: bash
-      env:
-        REMOTE_WRITE_URL: ${{ inputs.remote-write-url }}
-        REMOTE_WRITE_USERNAME: ${{ inputs.username }}
-        REMOTE_WRITE_PASSWORD: ${{ inputs.password }}
-        SCRAPE_INTERVAL: ${{ inputs.scrape-interval }}
-      run: |
-        set -euo pipefail
-        root="$RUNNER_METRICS_ROOT"
-        if [ -z "${REMOTE_WRITE_URL:-}" ]; then
-          echo "remote write url is empty, metrics are collected locally only"
-          echo "RUNNER_METRICS_REMOTE_WRITE=disabled" >> "$GITHUB_ENV"
-          exit 0
-        fi
-        url="$(printf '%s' "$REMOTE_WRITE_URL" | tr -d '[:space:]')"
-        username="$(printf '%s' "$REMOTE_WRITE_USERNAME" | tr -d '[:space:]')"
-        password="$(printf '%s' "$REMOTE_WRITE_PASSWORD" | tr -d '\r\n')"
-        if [ "${#url}" -ne "${#REMOTE_WRITE_URL}" ]; then echo "::warning::remote write url contained whitespace"; fi
-        if [ "${#username}" -ne "${#REMOTE_WRITE_USERNAME}" ]; then echo "::warning::username contained whitespace"; fi
-        if [ "${#password}" -ne "${#REMOTE_WRITE_PASSWORD}" ]; then echo "::warning::password contained line breaks"; fi
         umask 077
         printf '%s' "$password" > "$root/password"
         printf 'user = "%s"\n' "$(printf '%s:%s' "$username" "$password" | sed 's/\\/\\\\/g; s/"/\\"/g')" > "$root/curlrc"
         status="$(curl -sS -o /dev/null -w '%{http_code}' -K "$root/curlrc" \
+          --retry 2 --retry-delay 1 --retry-connrefused \
           -H 'Content-Type: application/x-protobuf' \
           -H 'Content-Encoding: snappy' \
           -H 'X-Prometheus-Remote-Write-Version: 0.1.0' \
@@ -149,7 +180,9 @@ runs:
         rm -f "$root/curlrc"
         echo "preflight http status: $status"
         case "$status" in
-          401|403) echo "endpoint rejected the basic auth credentials with http $status" >&2; exit 1 ;;
+          401 | 403) echo "endpoint rejected the basic auth credentials with http $status" >&2; exit 1 ;;
+          404) echo "::warning::endpoint answered http 404, check that the url ends with /api/v1/write" ;;
+          500 | 502 | 503) echo "::warning::endpoint answered http $status, check the receiver and its auth file" ;;
           000) echo "::warning::endpoint did not answer the preflight request" ;;
         esac
         esc() { printf '%s' "$1" | sed "s/'/''/g"; }
@@ -160,7 +193,7 @@ runs:
             gha_repository: '$(esc "$GITHUB_REPOSITORY")'
             gha_workflow: '$(esc "$GITHUB_WORKFLOW")'
             gha_job: '$(esc "$GITHUB_JOB")'
-            gha_job_name: '$(esc "$RUNNER_METRICS_JOB_NAME")'
+            gha_job_name: '$(esc "$name")'
             gha_run_id: '$(esc "$GITHUB_RUN_ID")'
             gha_run_number: '$(esc "$GITHUB_RUN_NUMBER")'
             gha_run_attempt: '$(esc "$GITHUB_RUN_ATTEMPT")'
@@ -172,16 +205,21 @@ runs:
             static_configs:
               - targets: ["127.0.0.1:9100"]
                 labels:
-                  instance: '$(esc "${GITHUB_WORKFLOW}/${RUNNER_METRICS_JOB_NAME}#${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}")'
+                  instance: '$(esc "${GITHUB_WORKFLOW}/${name}#${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}")'
             metric_relabel_configs:
               - source_labels: [__name__]
-                regex: "node_cpu_seconds_total|node_memory_MemTotal_bytes|node_memory_MemAvailable_bytes|node_memory_Cached_bytes|node_load1|node_disk_read_bytes_total|node_disk_written_bytes_total|node_disk_io_time_seconds_total|node_network_receive_bytes_total|node_network_transmit_bytes_total|node_filesystem_avail_bytes|node_filesystem_size_bytes|node_pressure_.*_waiting_seconds_total|gha_.*"
+                regex: 'node_cpu_seconds_total|node_memory_(MemTotal|MemAvailable|MemFree|Cached|Buffers|SwapTotal|SwapFree)_bytes|node_load(1|5)|node_vmstat_(oom_kill|pgmajfault|pswpin|pswpout)|node_disk_(read|written)_bytes_total|node_disk_io_time_seconds_total|node_network_(receive|transmit)_bytes_total|node_filesystem_(avail|size)_bytes|node_pressure_(cpu|io|memory)_(waiting|stalled)_seconds_total|gha_.*'
                 action: keep
+              - source_labels: [__name__, mode]
+                regex: 'node_cpu_seconds_total;(guest|guest_nice|irq|nice|softirq)'
+                action: drop
         remote_write:
           - url: '$(esc "$url")'
             basic_auth:
               username: '$(esc "$username")'
               password_file: '$(esc "$root/password")'
+            metadata_config:
+              send: false
             queue_config:
               max_shards: 1
               batch_send_deadline: 5s
@@ -199,10 +237,15 @@ runs:
           --storage.agent.path="$root/wal" \
           --web.listen-address=127.0.0.1:9099 \
           > "$root/prometheus.log" 2>&1 &
-        echo "RUNNER_METRICS_AGENT_PID=$!" >> "$GITHUB_ENV"
-        echo "RUNNER_METRICS_REMOTE_WRITE=enabled" >> "$GITHUB_ENV"
+        {
+          echo "RUNNER_METRICS_AGENT_PID=$!"
+          echo "RUNNER_METRICS_JOB_NAME=$name"
+          echo "RUNNER_METRICS_REMOTE_WRITE=enabled"
+        } >> "$GITHUB_ENV"
         for i in $(seq 1 30); do
-          if curl -fsS http://127.0.0.1:9099/metrics > /dev/null 2>&1; then break; fi
+          if curl -fsS -o /dev/null http://127.0.0.1:9099/-/ready || curl -fsS -o /dev/null http://127.0.0.1:9099/metrics; then exit 0; fi
           sleep 1
         done
-        curl -fsS http://127.0.0.1:9099/-/ready || true
+        echo "prometheus agent did not become ready" >&2
+        tail -n 25 "$root/prometheus.log" >&2 || true
+        exit 1
