@@ -10,10 +10,8 @@ GitHub-hosted раннера и стримят их в любой Prometheus rem
 | `.github/actions/runner-metrics-start` | Качает node_exporter и Prometheus, запускает их |
 | `.github/actions/runner-metrics-mark` | Отмечает текущий выполняющийся шаг |
 | `.github/actions/runner-metrics-stop` | Останавливает сборщики, печатает отчёт |
-| `.github/workflows/smoke.yml` | Сбор без отправки, отчёт в job summary |
-| `.github/workflows/matrix.yml` | То же самое на разных образах раннеров |
-| `.github/workflows/remote.yml` | Полный путь с реальной отправкой в remote write |
 | `.github/workflows/test.yml` | Линтеры, юнит-, интеграционные и e2e-тесты |
+| `.github/workflows/smoke.yml` | Ручной прогон против настоящего endpoint'а с проверкой запросом |
 | `scripts/` | Вся логика экшенов, вынесенная в bash-скрипты |
 | `tests/` | bats-тесты и фейковый приёмник remote write |
 
@@ -70,7 +68,8 @@ steps:
 | `lint` | shellcheck, actionlint, yamllint |
 | `unit` | чистые функции из `scripts/lib.sh`: парсинг exposition-формата, экранирование, валидация входов |
 | `integration` | настоящие node_exporter и Prometheus против фейкового приёмника на loopback: доставка, basic auth, preflight 401/404/нет ответа, отчёт |
-| `e2e` | сами композитные экшены в джобе — на x86 и arm |
+| `e2e` | сами композитные экшены в джобе |
+| `e2e-prometheus` | поднимает настоящий Prometheus с remote write receiver, гоняет джоб с двумя шагами и потом запросами проверяет, что метрики и шаги в нём есть и выглядят как надо |
 
 Юнит и интеграция запускаются через bats. Локально: `bats tests/unit tests/integration`.
 

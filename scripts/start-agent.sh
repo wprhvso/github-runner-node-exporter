@@ -73,10 +73,14 @@ if [ -z "$name" ]; then name="${GITHUB_JOB:-github_runner}"; fi
 echo "job name: $name"
 
 umask 077
-printf '%s' "$password" > "$root/password"
-printf 'user = "%s"\n' "$(runner_metrics_curl_escape "$username:$password")" > "$root/curlrc"
+auth=()
+if [ -n "$username" ]; then
+  printf '%s' "$password" > "$root/password"
+  printf 'user = "%s"\n' "$(runner_metrics_curl_escape "$username:$password")" > "$root/curlrc"
+  auth=(-K "$root/curlrc")
+fi
 
-status="$(curl -sS -o /dev/null -w '%{http_code}' -K "$root/curlrc" \
+status="$(curl -sS -o /dev/null -w '%{http_code}' "${auth[@]}" \
   --retry 2 --retry-delay 1 --retry-connrefused \
   -H 'Content-Type: application/x-protobuf' \
   -H 'Content-Encoding: snappy' \

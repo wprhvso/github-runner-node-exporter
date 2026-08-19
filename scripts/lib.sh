@@ -166,9 +166,11 @@ scrape_configs:
         action: drop
 remote_write:
   - url: '$(esc "$REMOTE_WRITE_URL")'
-    basic_auth:
-      username: '$(esc "$REMOTE_WRITE_USERNAME")'
-      password_file: '$(esc "$PASSWORD_FILE")'
+$(if [ -n "${REMOTE_WRITE_USERNAME:-}" ]; then
+  printf "    basic_auth:\n"
+  printf "      username: '%s'\n" "$(esc "$REMOTE_WRITE_USERNAME")"
+  printf "      password_file: '%s'\n" "$(esc "$PASSWORD_FILE")"
+fi)
     metadata_config:
       send: false
     queue_config:

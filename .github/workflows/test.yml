@@ -33,7 +33,7 @@ jobs:
           echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
 
       - name: Shellcheck
-        run: shellcheck -x --shell=bash scripts/*.sh tests/stubs/*
+        run: shellcheck -x --shell=bash scripts/*.sh tests/*.sh tests/stubs/*
 
       - name: Actionlint
         run: |
@@ -171,6 +171,52 @@ jobs:
           test ! -e "$RUNNER_METRICS_ROOT/agent.yml"
           if curl -fsS -o /dev/null --max-time 5 "http://127.0.0.1:$RUNNER_METRICS_AGENT_PORT/metrics"; then exit 1; fi
           if curl -fsS -o /dev/null --max-time 5 "http://127.0.0.1:$RUNNER_METRICS_NODE_EXPORTER_PORT/metrics"; then exit 1; fi
+
+  e2e-prometheus:
+    runs-on: pool
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Start a prometheus receiver
+        run: bash tests/prometheus-receiver.sh
+
+      - uses: ./.github/actions/runner-metrics-start
+        with:
+          remote-write-url: ${{ env.PROMETHEUS_RECEIVER_URL }}
+          scrape-interval: 1s
+
+      - uses: ./.github/actions/runner-metrics-mark
+        with:
+          step: burn cpu
+
+      - name: Burn cpu
+        run: |
+          for _ in $(seq 1 "$(nproc)"); do (timeout 15 bash -c 'while :; do :; done') & done
+          wait
+
+      - uses: ./.github/actions/runner-metrics-mark
+        with:
+          step: 'write "a" blob'
+
+      - name: Write a blob
+        run: |
+          dd if=/dev/zero of="$RUNNER_TEMP/blob" bs=1M count=512 conv=fdatasync status=none
+          rm -f "$RUNNER_TEMP/blob"
+          sleep 10
+
+      - uses: ./.github/actions/runner-metrics-stop
+        with:
+          drain-seconds: "5"
+          cleanup: "false"
+
+      - name: The metrics and the steps are queryable in prometheus
+        run: |
+          python3 tests/verify-in-prometheus.py \
+            --base "$PROMETHEUS_RECEIVER_BASE" \
+            --run-id "$GITHUB_RUN_ID" \
+            --job-name "$RUNNER_METRICS_JOB_NAME" \
+            --step 'burn cpu' \
+            --step 'write "a" blob'
 
   e2e-local-only:
     runs-on: pool
