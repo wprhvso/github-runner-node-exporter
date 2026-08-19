@@ -114,8 +114,8 @@ jobs:
           set -euo pipefail
           test -n "$RUNNER_METRICS_ROOT"
           test "$RUNNER_METRICS_REMOTE_WRITE" = enabled
-          curl -fsS -o /dev/null http://127.0.0.1:$RUNNER_METRICS_NODE_EXPORTER_PORT/metrics
-          curl -fsS -o /dev/null http://127.0.0.1:$RUNNER_METRICS_AGENT_PORT/metrics
+          curl -fsS -o /dev/null "http://127.0.0.1:$RUNNER_METRICS_NODE_EXPORTER_PORT/metrics"
+          curl -fsS -o /dev/null "http://127.0.0.1:$RUNNER_METRICS_AGENT_PORT/metrics"
           grep -q "gha_job_name: " "$RUNNER_METRICS_ROOT/agent.yml"
           test -s "$RUNNER_METRICS_ROOT/password"
 
@@ -129,7 +129,7 @@ jobs:
           wait
 
       - name: The active step is exposed
-        run: curl -fsS http://127.0.0.1:$RUNNER_METRICS_NODE_EXPORTER_PORT/metrics | grep -q 'gha_step_active{step="burn cpu"} 1'
+        run: curl -fsS "http://127.0.0.1:$RUNNER_METRICS_NODE_EXPORTER_PORT/metrics" | grep -q 'gha_step_active{step="burn cpu"} 1'
 
       - uses: ./.github/actions/runner-metrics-stop
         with:
@@ -169,8 +169,8 @@ jobs:
           test ! -e "$RUNNER_METRICS_ROOT/password"
           test ! -e "$RUNNER_METRICS_ROOT/curlrc"
           test ! -e "$RUNNER_METRICS_ROOT/agent.yml"
-          if curl -fsS -o /dev/null --max-time 5 http://127.0.0.1:$RUNNER_METRICS_AGENT_PORT/metrics; then exit 1; fi
-          if curl -fsS -o /dev/null --max-time 5 http://127.0.0.1:$RUNNER_METRICS_NODE_EXPORTER_PORT/metrics; then exit 1; fi
+          if curl -fsS -o /dev/null --max-time 5 "http://127.0.0.1:$RUNNER_METRICS_AGENT_PORT/metrics"; then exit 1; fi
+          if curl -fsS -o /dev/null --max-time 5 "http://127.0.0.1:$RUNNER_METRICS_NODE_EXPORTER_PORT/metrics"; then exit 1; fi
 
   e2e-local-only:
     runs-on: pool
@@ -184,7 +184,7 @@ jobs:
           set -euo pipefail
           test "$RUNNER_METRICS_REMOTE_WRITE" = disabled
           test ! -e "$RUNNER_METRICS_ROOT/bin/prometheus"
-          curl -fsS -o /dev/null http://127.0.0.1:$RUNNER_METRICS_NODE_EXPORTER_PORT/metrics
+          curl -fsS -o /dev/null "http://127.0.0.1:$RUNNER_METRICS_NODE_EXPORTER_PORT/metrics"
 
       - uses: ./.github/actions/runner-metrics-mark
         with:
@@ -220,7 +220,7 @@ jobs:
           step: 'step "with" quotes'
 
       - name: The marker survived the quotes
-        run: curl -fsS http://127.0.0.1:$RUNNER_METRICS_NODE_EXPORTER_PORT/metrics | grep -q 'gha_step_active{step="step \\"with\\" quotes"} 1'
+        run: curl -fsS "http://127.0.0.1:$RUNNER_METRICS_NODE_EXPORTER_PORT/metrics" | grep -q 'gha_step_active{step="step \\"with\\" quotes"} 1'
 
       - uses: ./.github/actions/runner-metrics-stop
         with:
