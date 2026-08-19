@@ -13,6 +13,9 @@ GitHub-hosted раннера и стримят их в любой Prometheus rem
 | `.github/workflows/smoke.yml` | Сбор без отправки, отчёт в job summary |
 | `.github/workflows/matrix.yml` | То же самое на разных образах раннеров |
 | `.github/workflows/remote.yml` | Полный путь с реальной отправкой в remote write |
+| `.github/workflows/test.yml` | Линтеры, юнит-, интеграционные и e2e-тесты |
+| `scripts/` | Вся логика экшенов, вынесенная в bash-скрипты |
+| `tests/` | bats-тесты и фейковый приёмник remote write |
 
 ## Как использовать в своём workflow
 
@@ -58,9 +61,23 @@ steps:
 и больше ничего, так что либо выдавайте `actions: read` вызывающей джобе, либо
 просто задавайте `job-name`. С заданным `job-name` экшен в API не ходит вовсе.
 
+## Тесты
+
+`test.yml` гоняет всё на push и pull request:
+
+| Джоб | Что проверяет |
+| --- | --- |
+| `lint` | shellcheck, actionlint, yamllint |
+| `unit` | чистые функции из `scripts/lib.sh`: парсинг exposition-формата, экранирование, валидация входов |
+| `integration` | настоящие node_exporter и Prometheus против фейкового приёмника на loopback: доставка, basic auth, preflight 401/404/нет ответа, отчёт |
+| `e2e` | сами композитные экшены в джобе — на x86 и arm |
+
+Юнит и интеграция запускаются через bats. Локально: `bats tests/unit tests/integration`.
+
 ## Требования к endpoint'у
 
-Нужен HTTPS и basic auth. Приёмником может быть Prometheus, запущенный с
+Нужен HTTPS и basic auth. Экшен отказывается стартовать с `http://`, кроме
+loopback-адресов, которые нужны тестам. Приёмником может быть Prometheus, запущенный с
 `--web.enable-remote-write-receiver`, VictoriaMetrics, Mimir или Grafana Cloud.
 Пароль летит в каждом запросе, поэтому HTTP без TLS использовать нельзя.
 
@@ -126,10 +143,18 @@ steps:
 
 ## Отчёт в job summary
 
+Числовые входы (`drain-seconds`, `flush-timeout`) при мусорном значении молча
+откатываются к дефолту, а не роняют джоб и не оставляют пароль на диске.
+`scrape-interval` и версии бинарей, наоборот, проверяются до старта: с
+некорректным значением джоб падает сразу, а не через минуту в логах Prometheus.
+
 `stop` пишет в summary таблицу с числом ядер, памятью, свободным местом,
 счётчиком OOM kill'ов и накопленным PSI, а также хвосты логов обоих процессов.
 Если OOM killer срабатывал, экшен дополнительно ставит warning на джоб — его
 видно в списке чеков, не заходя в логи.
+
+Тот же отчёт остаётся на раннере в `$RUNNER_METRICS_ROOT/report.md`, если
+выключить `cleanup`.
 
 Входы `stop`: `drain-seconds` (по умолчанию 5 — сколько ещё собирать перед
 выключением), `flush-timeout` (30 — сколько ждать досылки), `report` (`true`) и

@@ -1,0 +1,228 @@
+name: Tests
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Shellcheck
+        run: shellcheck -x --shell=bash scripts/*.sh tests/stubs/*
+
+      - name: Actionlint
+        run: |
+          set -euo pipefail
+          bash <(curl -fsSL --retry 3 https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
+
+      - name: Yamllint
+        run: |
+          set -euo pipefail
+          pipx install yamllint > /dev/null
+          yamllint -c .yamllint .github tests .yamllint
+
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install bats
+        run: npm install --no-fund --no-audit --global bats@1.11.1
+
+      - name: Run unit tests
+        run: bats --print-output-on-failure --timing tests/unit
+
+  integration:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install bats
+        run: npm install --no-fund --no-audit --global bats@1.11.1
+
+      - name: Run integration tests
+        run: bats --print-output-on-failure --timing tests/integration
+
+  e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Start a remote write receiver
+        run: |
+          set -euo pipefail
+          nohup python3 tests/integration/receiver.py --port 19301 --user metrics \
+            --password 's3cr3t pass"word' --status 204 --state "$RUNNER_TEMP/receiver.json" \
+            > "$RUNNER_TEMP/receiver.log" 2>&1 &
+          for _ in $(seq 1 50); do
+            if curl -fsS -o /dev/null http://127.0.0.1:19301/; then exit 0; fi
+            sleep 0.2
+          done
+          cat "$RUNNER_TEMP/receiver.log"
+          exit 1
+
+      - uses: ./.github/actions/runner-metrics-start
+        with:
+          remote-write-url: http://127.0.0.1:19301/api/v1/write
+          username: metrics
+          password: 's3cr3t pass"word'
+          scrape-interval: 2s
+
+      - name: The collectors are up and labelled
+        run: |
+          set -euo pipefail
+          test -n "$RUNNER_METRICS_ROOT"
+          test "$RUNNER_METRICS_REMOTE_WRITE" = enabled
+          curl -fsS -o /dev/null http://127.0.0.1:9100/metrics
+          curl -fsS -o /dev/null http://127.0.0.1:9099/metrics
+          grep -q "gha_job_name: " "$RUNNER_METRICS_ROOT/agent.yml"
+          test -s "$RUNNER_METRICS_ROOT/password"
+
+      - uses: ./.github/actions/runner-metrics-mark
+        with:
+          step: burn cpu
+
+      - name: Burn cpu
+        run: |
+          for _ in $(seq 1 "$(nproc)"); do (timeout 20 bash -c 'while :; do :; done') & done
+          wait
+
+      - name: The active step is exposed
+        run: curl -fsS http://127.0.0.1:9100/metrics | grep -q 'gha_step_active{step="burn cpu"} 1'
+
+      - uses: ./.github/actions/runner-metrics-stop
+        with:
+          drain-seconds: "3"
+          cleanup: "false"
+
+      - name: The endpoint received authenticated samples
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/receiver.json" <<'PY'
+          import json, sys
+          state = json.load(open(sys.argv[1]))
+          print(state)
+          assert state["accepted"] > 0, "the endpoint never received an accepted write"
+          assert state["rejected"] == 0, "the endpoint rejected the credentials"
+          assert state["snappy"] == state["accepted"], "a write was not snappy encoded"
+          assert state["paths"] == ["/api/v1/write"], state["paths"]
+          PY
+
+      - name: The report describes the run
+        run: |
+          set -euo pipefail
+          report="$RUNNER_METRICS_ROOT/report.md"
+          cat "$report"
+          grep -q '^## Runner metrics report$' "$report"
+          grep -q '^remote write: enabled$' "$report"
+          grep -qE '^\| CPU cores \| [1-9][0-9]* \|$' "$report"
+          grep -qE '^\| Memory total \| [0-9]+\.[0-9]{2} GiB \|$' "$report"
+          grep -qE '^\| Free space on / \| [0-9]+\.[0-9]{2} GiB \|$' "$report"
+          grep -q 'prometheus_remote_storage_samples' "$report"
+          grep -q '^### prometheus log$' "$report"
+
+      - name: The secrets are gone and the collectors are stopped
+        run: |
+          set -euo pipefail
+          test ! -e "$RUNNER_METRICS_ROOT/password"
+          test ! -e "$RUNNER_METRICS_ROOT/curlrc"
+          test ! -e "$RUNNER_METRICS_ROOT/agent.yml"
+          ! curl -fsS -o /dev/null --max-time 5 http://127.0.0.1:9099/metrics
+          ! curl -fsS -o /dev/null --max-time 5 http://127.0.0.1:9100/metrics
+
+  e2e-local-only:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/runner-metrics-start
+
+      - name: Prometheus was not downloaded
+        run: |
+          set -euo pipefail
+          test "$RUNNER_METRICS_REMOTE_WRITE" = disabled
+          test ! -e "$RUNNER_METRICS_ROOT/bin/prometheus"
+          curl -fsS -o /dev/null http://127.0.0.1:9100/metrics
+
+      - uses: ./.github/actions/runner-metrics-mark
+        with:
+          step: idle
+
+      - name: Idle
+        run: sleep 5
+
+      - uses: ./.github/actions/runner-metrics-stop
+        with:
+          drain-seconds: "1"
+          cleanup: "false"
+
+      - name: The report says the collection was local
+        run: |
+          set -euo pipefail
+          grep -q '^remote write: disabled$' "$RUNNER_METRICS_ROOT/report.md"
+          ! grep -q 'Remote storage' "$RUNNER_METRICS_ROOT/report.md"
+          test ! -e "$RUNNER_METRICS_ROOT/bin/prometheus"
+
+  e2e-hostile-inputs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/runner-metrics-start
+        with:
+          remote-write-url: "  "
+          job-name: "matrix (o'brien)"
+
+      - uses: ./.github/actions/runner-metrics-mark
+        with:
+          step: 'step "with" quotes'
+
+      - name: The marker survived the quotes
+        run: curl -fsS http://127.0.0.1:9100/metrics | grep -q 'gha_step_active{step="step \\"with\\" quotes"} 1'
+
+      - uses: ./.github/actions/runner-metrics-stop
+        with:
+          drain-seconds: "0"
+          flush-timeout: "not a number"
+          cleanup: "false"
+
+      - name: A garbage timeout still stopped everything cleanly
+        run: |
+          set -euo pipefail
+          test ! -e "$RUNNER_METRICS_ROOT/password"
+          grep -q '^## Runner metrics report$' "$RUNNER_METRICS_ROOT/report.md"
+
+  e2e-stop-without-start:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/runner-metrics-mark
+        with:
+          step: never marked
+
+      - uses: ./.github/actions/runner-metrics-stop
+
+      - name: Nothing was collected and nothing failed
+        run: test -z "${RUNNER_METRICS_ROOT:-}"
