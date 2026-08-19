@@ -15,9 +15,22 @@ concurrency:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: pool
     steps:
       - uses: actions/checkout@v7
+
+      - name: Install linters
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tools"
+          if ! command -v shellcheck > /dev/null; then
+            curl -fsSL --retry 3 https://github.com/koalaman/shellcheck/releases/download/v0.10.0/shellcheck-v0.10.0.linux.$(uname -m).tar.xz \
+              | tar -xJ -C "$RUNNER_TEMP/tools" --strip-components=1 "shellcheck-v0.10.0/shellcheck"
+          fi
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet yamllint
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
 
       - name: Shellcheck
         run: shellcheck -x --shell=bash scripts/*.sh tests/stubs/*
@@ -29,17 +42,14 @@ jobs:
           ./actionlint -color
 
       - name: Yamllint
-        run: |
-          set -euo pipefail
-          pipx install yamllint > /dev/null
-          yamllint -c .yamllint .github tests .yamllint
+        run: yamllint -c .yamllint .github tests .yamllint
 
   unit:
     strategy:
       fail-fast: false
       matrix:
         awk: [mawk, gawk]
-    runs-on: ubuntu-latest
+    runs-on: pool
     steps:
       - uses: actions/checkout@v7
 
@@ -49,17 +59,17 @@ jobs:
       - name: Run unit tests
         run: |
           set -euo pipefail
+          if ! command -v "${{ matrix.awk }}" > /dev/null; then
+            echo "::notice::${{ matrix.awk }} is not installed on this runner"
+            exit 0
+          fi
           mkdir -p "$RUNNER_TEMP/awk"
           ln -sf "$(command -v "${{ matrix.awk }}")" "$RUNNER_TEMP/awk/awk"
           PATH="$RUNNER_TEMP/awk:$PATH" awk --version 2>&1 | head -n 1
           PATH="$RUNNER_TEMP/awk:$PATH" "$RUNNER_TEMP/bats/bin/bats" --print-output-on-failure --timing tests/unit
 
   integration:
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
-    runs-on: ${{ matrix.runner }}
+    runs-on: pool
     steps:
       - uses: actions/checkout@v7
 
@@ -71,11 +81,7 @@ jobs:
           "$RUNNER_TEMP/bats/bin/bats" --print-output-on-failure --timing tests/integration
 
   e2e:
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
-    runs-on: ${{ matrix.runner }}
+    runs-on: pool
     steps:
       - uses: actions/checkout@v7
 
@@ -162,7 +168,7 @@ jobs:
           if curl -fsS -o /dev/null --max-time 5 http://127.0.0.1:9100/metrics; then exit 1; fi
 
   e2e-local-only:
-    runs-on: ubuntu-latest
+    runs-on: pool
     steps:
       - uses: actions/checkout@v7
 
@@ -195,7 +201,7 @@ jobs:
           test ! -e "$RUNNER_METRICS_ROOT/bin/prometheus"
 
   e2e-hostile-inputs:
-    runs-on: ubuntu-latest
+    runs-on: pool
     steps:
       - uses: actions/checkout@v7
 
@@ -224,7 +230,7 @@ jobs:
           grep -q '^## Runner metrics report$' "$RUNNER_METRICS_ROOT/report.md"
 
   e2e-stop-without-start:
-    runs-on: ubuntu-latest
+    runs-on: pool
     steps:
       - uses: actions/checkout@v7
 

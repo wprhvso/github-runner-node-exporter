@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   smoke:
-    runs-on: ubuntu-latest
+    runs-on: pool
     steps:
       - uses: actions/checkout@v7
 
@@ -46,7 +46,7 @@ jobs:
         if: always()
 
   noop:
-    runs-on: ubuntu-latest
+    runs-on: pool
     steps:
       - uses: actions/checkout@v7
 

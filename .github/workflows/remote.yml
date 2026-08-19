@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   remote:
-    runs-on: ubuntu-latest
+    runs-on: pool
     steps:
       - uses: actions/checkout@v7
 
