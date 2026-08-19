@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# shellcheck source=scripts/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
 root="$RUNNER_METRICS_ROOT"
-port="${NODE_EXPORTER_PORT:-9100}"
+if [ -n "${NODE_EXPORTER_PORT:-}" ]; then
+  port="$NODE_EXPORTER_PORT"
+elif ! port="$(runner_metrics_free_port 9100 9199)"; then
+  echo "no free port for node_exporter between 9100 and 9199" >&2
+  exit 1
+fi
 
 GOMAXPROCS=1 GOGC=50 nohup "$root/bin/node_exporter" \
   --web.listen-address="127.0.0.1:$port" \

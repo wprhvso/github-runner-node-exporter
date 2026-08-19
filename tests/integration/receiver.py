@@ -13,7 +13,7 @@ parser.add_argument("--state", required=True)
 args = parser.parse_args()
 
 lock = threading.Lock()
-state = {"accepted": 0, "rejected": 0, "bytes": 0, "snappy": 0, "paths": []}
+state = {"accepted": 0, "rejected": 0, "bytes": 0, "snappy": 0, "paths": [], "writes": 0, "port": 0}
 
 
 def flush():
@@ -36,6 +36,8 @@ class Handler(BaseHTTPRequestHandler):
         with lock:
             if authorized:
                 state["accepted"] += 1
+                if body:
+                    state["writes"] += 1
                 state["bytes"] += len(body)
                 if self.headers.get("Content-Encoding") == "snappy":
                     state["snappy"] += 1
@@ -56,5 +58,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"ok")
 
 
+server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+state["port"] = server.server_address[1]
 flush()
-ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
+server.serve_forever()

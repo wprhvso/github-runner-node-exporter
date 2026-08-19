@@ -61,7 +61,7 @@ jobs:
         run: |
           set -euo pipefail
           sleep 20
-          stats="$(curl -fsS http://127.0.0.1:9099/metrics)"
+          stats="$(curl -fsS http://127.0.0.1:$RUNNER_METRICS_AGENT_PORT/metrics)"
           echo "$stats" | grep -E '^prometheus_remote_storage_samples' || true
           sum() { echo "$stats" | awk -v pattern="^$1" '$0 ~ pattern { s += $NF } END { printf "%.0f", s + 0 }'; }
           sent="$(sum 'prometheus_remote_storage_(succeeded_)?samples_total')"

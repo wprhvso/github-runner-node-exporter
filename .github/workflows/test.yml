@@ -24,7 +24,7 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/tools"
           if ! command -v shellcheck > /dev/null; then
-            curl -fsSL --retry 3 https://github.com/koalaman/shellcheck/releases/download/v0.10.0/shellcheck-v0.10.0.linux.$(uname -m).tar.xz \
+            curl -fsSL --retry 3 "https://github.com/koalaman/shellcheck/releases/download/v0.10.0/shellcheck-v0.10.0.linux.$(uname -m).tar.xz" \
               | tar -xJ -C "$RUNNER_TEMP/tools" --strip-components=1 "shellcheck-v0.10.0/shellcheck"
           fi
           python3 -m venv "$RUNNER_TEMP/venv"
@@ -88,11 +88,15 @@ jobs:
       - name: Start a remote write receiver
         run: |
           set -euo pipefail
-          nohup python3 tests/integration/receiver.py --port 19301 --user metrics \
+          nohup python3 tests/integration/receiver.py --port 0 --user metrics \
             --password 's3cr3t pass"word' --status 204 --state "$RUNNER_TEMP/receiver.json" \
             > "$RUNNER_TEMP/receiver.log" 2>&1 &
           for _ in $(seq 1 50); do
-            if curl -fsS -o /dev/null http://127.0.0.1:19301/; then exit 0; fi
+            port="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["port"])' "$RUNNER_TEMP/receiver.json" 2>/dev/null || echo 0)"
+            if [ "$port" -gt 0 ] && curl -fsS -o /dev/null "http://127.0.0.1:$port/"; then
+              echo "RECEIVER_URL=http://127.0.0.1:$port/api/v1/write" >> "$GITHUB_ENV"
+              exit 0
+            fi
             sleep 0.2
           done
           cat "$RUNNER_TEMP/receiver.log"
@@ -100,7 +104,7 @@ jobs:
 
       - uses: ./.github/actions/runner-metrics-start
         with:
-          remote-write-url: http://127.0.0.1:19301/api/v1/write
+          remote-write-url: ${{ env.RECEIVER_URL }}
           username: metrics
           password: 's3cr3t pass"word'
           scrape-interval: 2s
@@ -110,8 +114,8 @@ jobs:
           set -euo pipefail
           test -n "$RUNNER_METRICS_ROOT"
           test "$RUNNER_METRICS_REMOTE_WRITE" = enabled
-          curl -fsS -o /dev/null http://127.0.0.1:9100/metrics
-          curl -fsS -o /dev/null http://127.0.0.1:9099/metrics
+          curl -fsS -o /dev/null http://127.0.0.1:$RUNNER_METRICS_NODE_EXPORTER_PORT/metrics
+          curl -fsS -o /dev/null http://127.0.0.1:$RUNNER_METRICS_AGENT_PORT/metrics
           grep -q "gha_job_name: " "$RUNNER_METRICS_ROOT/agent.yml"
           test -s "$RUNNER_METRICS_ROOT/password"
 
@@ -125,7 +129,7 @@ jobs:
           wait
 
       - name: The active step is exposed
-        run: curl -fsS http://127.0.0.1:9100/metrics | grep -q 'gha_step_active{step="burn cpu"} 1'
+        run: curl -fsS http://127.0.0.1:$RUNNER_METRICS_NODE_EXPORTER_PORT/metrics | grep -q 'gha_step_active{step="burn cpu"} 1'
 
       - uses: ./.github/actions/runner-metrics-stop
         with:
@@ -139,7 +143,8 @@ jobs:
           import json, sys
           state = json.load(open(sys.argv[1]))
           print(state)
-          assert state["accepted"] > 0, "the endpoint never received an accepted write"
+          assert state["writes"] > 0, "the endpoint never received a sample batch"
+          assert state["bytes"] > 0, "every accepted write was empty"
           assert state["rejected"] == 0, "the endpoint rejected the credentials"
           assert state["snappy"] == state["accepted"], "a write was not snappy encoded"
           assert state["paths"] == ["/api/v1/write"], state["paths"]
@@ -164,8 +169,8 @@ jobs:
           test ! -e "$RUNNER_METRICS_ROOT/password"
           test ! -e "$RUNNER_METRICS_ROOT/curlrc"
           test ! -e "$RUNNER_METRICS_ROOT/agent.yml"
-          if curl -fsS -o /dev/null --max-time 5 http://127.0.0.1:9099/metrics; then exit 1; fi
-          if curl -fsS -o /dev/null --max-time 5 http://127.0.0.1:9100/metrics; then exit 1; fi
+          if curl -fsS -o /dev/null --max-time 5 http://127.0.0.1:$RUNNER_METRICS_AGENT_PORT/metrics; then exit 1; fi
+          if curl -fsS -o /dev/null --max-time 5 http://127.0.0.1:$RUNNER_METRICS_NODE_EXPORTER_PORT/metrics; then exit 1; fi
 
   e2e-local-only:
     runs-on: pool
@@ -179,7 +184,7 @@ jobs:
           set -euo pipefail
           test "$RUNNER_METRICS_REMOTE_WRITE" = disabled
           test ! -e "$RUNNER_METRICS_ROOT/bin/prometheus"
-          curl -fsS -o /dev/null http://127.0.0.1:9100/metrics
+          curl -fsS -o /dev/null http://127.0.0.1:$RUNNER_METRICS_NODE_EXPORTER_PORT/metrics
 
       - uses: ./.github/actions/runner-metrics-mark
         with:
@@ -215,7 +220,7 @@ jobs:
           step: 'step "with" quotes'
 
       - name: The marker survived the quotes
-        run: curl -fsS http://127.0.0.1:9100/metrics | grep -q 'gha_step_active{step="step \\"with\\" quotes"} 1'
+        run: curl -fsS http://127.0.0.1:$RUNNER_METRICS_NODE_EXPORTER_PORT/metrics | grep -q 'gha_step_active{step="step \\"with\\" quotes"} 1'
 
       - uses: ./.github/actions/runner-metrics-stop
         with:

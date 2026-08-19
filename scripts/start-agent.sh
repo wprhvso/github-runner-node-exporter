@@ -106,7 +106,12 @@ else
 fi
 echo "agent flag: $agent_flag"
 
-agent_port="${AGENT_PORT:-9099}"
+if [ -n "${AGENT_PORT:-}" ]; then
+  agent_port="$AGENT_PORT"
+elif ! agent_port="$(runner_metrics_free_port 9090 9098)"; then
+  echo "no free port for the prometheus agent between 9090 and 9098" >&2
+  exit 1
+fi
 GOMAXPROCS=1 GOGC=50 nohup "$root/bin/prometheus" "$agent_flag" \
   --config.file="$root/agent.yml" \
   --storage.agent.path="$root/wal" \

@@ -3,6 +3,7 @@
 setup_file() {
   export REPO_ROOT="$(cd "$BATS_TEST_DIRNAME/../.." && pwd)"
   export SCRIPTS="$REPO_ROOT/scripts"
+  . "$SCRIPTS/lib.sh"
   export RUNNER_METRICS_ROOT="$BATS_FILE_TMPDIR/root"
   export GITHUB_ENV="$BATS_FILE_TMPDIR/env"
   : > "$GITHUB_ENV"
@@ -10,7 +11,7 @@ setup_file() {
   RUNNER_TEMP="$BATS_FILE_TMPDIR" REMOTE_WRITE_URL=https://example.test/api/v1/write \
     bash "$SCRIPTS/install-collectors.sh"
 
-  export NODE_EXPORTER_PORT=19100
+  export NODE_EXPORTER_PORT="$(runner_metrics_free_port 19100 19199)"
   export RUNNER_METRICS_TEXTFILE_DIR="$RUNNER_METRICS_ROOT/textfile"
   bash "$SCRIPTS/start-node-exporter.sh"
   export NODE_EXPORTER_PID="$(awk -F= '/^RUNNER_METRICS_NODE_EXPORTER_PID=/ { print $2 }' "$GITHUB_ENV")"
@@ -25,6 +26,7 @@ teardown_file() {
 setup() {
   export REPO_ROOT="$(cd "$BATS_TEST_DIRNAME/../.." && pwd)"
   export SCRIPTS="$REPO_ROOT/scripts"
+  . "$SCRIPTS/lib.sh"
   export GITHUB_ENV="$BATS_TEST_TMPDIR/env"
   export GITHUB_STEP_SUMMARY="$BATS_TEST_TMPDIR/summary"
   : > "$GITHUB_ENV"
@@ -32,14 +34,18 @@ setup() {
 }
 
 start_receiver() {
-  local port="$1" status="${2:-204}" user="${3:-metrics}" password="${4:-s3cr3t}"
+  local status="${1:-204}" user="${2:-metrics}" password="${3:-s3cr3t}"
   RECEIVER_STATE="$BATS_TEST_TMPDIR/receiver.json"
-  python3 "$BATS_TEST_DIRNAME/receiver.py" --port "$port" --user "$user" \
+  python3 "$BATS_TEST_DIRNAME/receiver.py" --port 0 --user "$user" \
     --password "$password" --status "$status" --state "$RECEIVER_STATE" &
   RECEIVER_PID=$!
   for _ in $(seq 1 50); do
     kill -0 "$RECEIVER_PID" 2>/dev/null || return 1
-    curl -fsS -o /dev/null "http://127.0.0.1:$port/" && return 0
+    RECEIVER_PORT="$(receiver_field port 2>/dev/null || echo 0)"
+    if [ "${RECEIVER_PORT:-0}" -gt 0 ] && curl -fsS -o /dev/null "http://127.0.0.1:$RECEIVER_PORT/"; then
+      RECEIVER_URL="http://127.0.0.1:$RECEIVER_PORT/api/v1/write"
+      return 0
+    fi
     sleep 0.2
   done
   return 1
@@ -132,10 +138,11 @@ receiver_field() {
 }
 
 @test "samples reach an endpoint that accepts the credentials" {
-  start_receiver 19201
+  start_receiver
   root="$(agent_root)"
-  RUNNER_METRICS_ROOT="$root" RUNNER_METRICS_NODE_EXPORTER_PORT="$NODE_EXPORTER_PORT" AGENT_PORT=19099 \
-  REMOTE_WRITE_URL="http://127.0.0.1:19201/api/v1/write" REMOTE_WRITE_USERNAME=metrics \
+  agent_port="$(runner_metrics_free_port 19000 19099)"
+  RUNNER_METRICS_ROOT="$root" RUNNER_METRICS_NODE_EXPORTER_PORT="$NODE_EXPORTER_PORT" AGENT_PORT="$agent_port" \
+  REMOTE_WRITE_URL="$RECEIVER_URL" REMOTE_WRITE_USERNAME=metrics \
   REMOTE_WRITE_PASSWORD=s3cr3t JOB_NAME_OVERRIDE="integration job" \
   GITHUB_WORKFLOW=Test GITHUB_REPOSITORY=owner/repo GITHUB_JOB=test GITHUB_RUN_ID=1 \
   GITHUB_RUN_NUMBER=1 GITHUB_RUN_ATTEMPT=1 GITHUB_REF_NAME=main RUNNER_OS=Linux RUNNER_ARCH=X64 \
@@ -143,21 +150,21 @@ receiver_field() {
   grep -q '^RUNNER_METRICS_REMOTE_WRITE=enabled$' "$GITHUB_ENV"
 
   for _ in $(seq 1 40); do
-    [ "$(receiver_field accepted)" -gt 0 ] && break
+    [ "$(receiver_field writes)" -gt 0 ] && break
     sleep 1
   done
-  [ "$(receiver_field accepted)" -gt 0 ]
+  [ "$(receiver_field writes)" -gt 0 ]
   [ "$(receiver_field rejected)" -eq 0 ]
   [ "$(receiver_field snappy)" -gt 0 ]
   [ "$(receiver_field bytes)" -gt 0 ]
 
-  curl -fsS http://127.0.0.1:19099/metrics > "$BATS_TEST_TMPDIR/agent.prom"
+  curl -fsS "http://127.0.0.1:$agent_port/metrics" > "$BATS_TEST_TMPDIR/agent.prom"
   . "$SCRIPTS/lib.sh"
   failed="$(runner_metrics_metric_sum "$BATS_TEST_TMPDIR/agent.prom" prometheus_remote_storage_samples_failed_total)"
   [ "${failed%%.*}" -eq 0 ]
 
   agent_pid="$(awk -F= '/^RUNNER_METRICS_AGENT_PID=/ { print $2 }' "$GITHUB_ENV")"
-  RUNNER_METRICS_AGENT_PID="$agent_pid" RUNNER_METRICS_AGENT_PORT=19099 \
+  RUNNER_METRICS_AGENT_PID="$agent_pid" RUNNER_METRICS_AGENT_PORT="$agent_port" \
   RUNNER_METRICS_ROOT="$root" FLUSH_TIMEOUT=10 CLEANUP=false WRITE_REPORT=false \
     bash "$SCRIPTS/stop-collectors.sh"
   run kill -0 "$agent_pid"
@@ -168,36 +175,39 @@ receiver_field() {
 }
 
 @test "the job fails fast when the endpoint rejects the credentials" {
-  start_receiver 19202
-  run env RUNNER_METRICS_ROOT="$(agent_root)" AGENT_PORT=19098 \
-    REMOTE_WRITE_URL="http://127.0.0.1:19202/api/v1/write" REMOTE_WRITE_USERNAME=metrics \
+  start_receiver
+  agent_port="$(runner_metrics_free_port 19000 19099)"
+  run env RUNNER_METRICS_ROOT="$(agent_root)" AGENT_PORT="$agent_port" \
+    REMOTE_WRITE_URL="$RECEIVER_URL" REMOTE_WRITE_USERNAME=metrics \
     REMOTE_WRITE_PASSWORD=wrong JOB_NAME_OVERRIDE=job GITHUB_JOB=job \
     bash "$SCRIPTS/start-agent.sh"
   [ "$status" -ne 0 ]
   echo "$output" | grep -q 'rejected the basic auth credentials with http 401'
-  run curl -fsS -o /dev/null http://127.0.0.1:19098/metrics
+  run curl -fsS -o /dev/null "http://127.0.0.1:$agent_port/metrics"
   [ "$status" -ne 0 ]
   stop_receiver
 }
 
 @test "a 404 endpoint only warns and the agent still runs" {
-  start_receiver 19203 404
-  run env RUNNER_METRICS_ROOT="$(agent_root)" AGENT_PORT=19097 \
+  start_receiver 404
+  agent_port="$(runner_metrics_free_port 19000 19099)"
+  run env RUNNER_METRICS_ROOT="$(agent_root)" AGENT_PORT="$agent_port" \
     RUNNER_METRICS_NODE_EXPORTER_PORT="$NODE_EXPORTER_PORT" \
-    REMOTE_WRITE_URL="http://127.0.0.1:19203/api/v1/write" REMOTE_WRITE_USERNAME=metrics \
+    REMOTE_WRITE_URL="$RECEIVER_URL" REMOTE_WRITE_USERNAME=metrics \
     REMOTE_WRITE_PASSWORD=s3cr3t JOB_NAME_OVERRIDE=job GITHUB_JOB=job GITHUB_WORKFLOW=Test \
     GITHUB_REPOSITORY=owner/repo GITHUB_RUN_ID=1 GITHUB_RUN_NUMBER=1 GITHUB_RUN_ATTEMPT=1 \
     GITHUB_REF_NAME=main RUNNER_OS=Linux RUNNER_ARCH=X64 GITHUB_ENV="$GITHUB_ENV" \
     bash "$SCRIPTS/start-agent.sh"
   [ "$status" -eq 0 ]
   echo "$output" | grep -q '::warning::endpoint answered http 404'
-  curl -fsS -o /dev/null http://127.0.0.1:19097/metrics
+  curl -fsS -o /dev/null "http://127.0.0.1:$agent_port/metrics"
   kill "$(awk -F= '/^RUNNER_METRICS_AGENT_PID=/ { print $2 }' "$GITHUB_ENV")" 2>/dev/null
   stop_receiver
 }
 
 @test "an endpoint that is not listening only warns" {
-  run env RUNNER_METRICS_ROOT="$(agent_root)" AGENT_PORT=19096 \
+  agent_port="$(runner_metrics_free_port 19000 19099)"
+  run env RUNNER_METRICS_ROOT="$(agent_root)" AGENT_PORT="$agent_port" \
     RUNNER_METRICS_NODE_EXPORTER_PORT="$NODE_EXPORTER_PORT" \
     REMOTE_WRITE_URL="http://127.0.0.1:19299/api/v1/write" REMOTE_WRITE_USERNAME=metrics \
     REMOTE_WRITE_PASSWORD=s3cr3t JOB_NAME_OVERRIDE=job GITHUB_JOB=job GITHUB_WORKFLOW=Test \

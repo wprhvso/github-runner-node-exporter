@@ -205,3 +205,19 @@ runner_metrics_preflight_verdict() {
     *) printf 'ok:' ;;
   esac
 }
+
+runner_metrics_port_is_free() {
+  ! (exec 3<> "/dev/tcp/127.0.0.1/$1") 2> /dev/null
+}
+
+runner_metrics_free_port() {
+  local port="$1" last="$2"
+  while [ "$port" -le "$last" ]; do
+    if runner_metrics_port_is_free "$port"; then
+      printf '%s' "$port"
+      return 0
+    fi
+    port=$(( port + 1 ))
+  done
+  return 1
+}
