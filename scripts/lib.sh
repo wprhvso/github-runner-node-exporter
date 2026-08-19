@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 
+LC_ALL=C
+export LC_ALL
+
 runner_metrics_trim_space() {
   printf '%s' "$1" | tr -d '[:space:]'
 }
@@ -55,20 +58,20 @@ runner_metrics_awk_parser() {
       if (cut == 0) return line
       return substr(line, 1, cut - 1)
     }
-    function prom_labels(line,   open, close, i) {
-      open = index(line, "{")
-      if (open == 0) return ""
-      close = 0
-      for (i = length(line); i > open; i--) {
-        if (substr(line, i, 1) == "}") { close = i; break }
+    function prom_labels(line,   from, to, i) {
+      from = index(line, "{")
+      if (from == 0) return ""
+      to = 0
+      for (i = length(line); i > from; i--) {
+        if (substr(line, i, 1) == "}") { to = i; break }
       }
-      if (close == 0) return ""
-      return substr(line, open + 1, close - open - 1)
+      if (to == 0) return ""
+      return substr(line, from + 1, to - from - 1)
     }
-    function prom_value(line,   n, parts) {
-      n = split(line, parts, " ")
-      if (n < 2) return ""
-      return parts[n]
+    function prom_value(line,   fields, parts) {
+      fields = split(line, parts, " ")
+      if (fields < 2) return ""
+      return parts[fields]
     }
     function prom_label(labels, key,   pattern, start, rest, out, c, escaped, i) {
       pattern = key "=\""

@@ -30,7 +30,7 @@ jobs:
 
       - name: Load
         run: |
-          for i in $(seq 1 "$(nproc)"); do (timeout 30 bash -c 'while :; do :; done') & done
+          for _ in $(seq 1 "$(nproc)"); do (timeout 30 bash -c 'while :; do :; done') & done
           wait
 
       - uses: ./.github/actions/runner-metrics-stop
